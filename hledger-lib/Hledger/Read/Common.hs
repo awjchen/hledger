@@ -89,7 +89,10 @@ module Hledger.Read.Common (
   tagsp,
 
   -- ** bracketed dates
-  bracketeddatetagsp
+  bracketeddatetagsp,
+
+  -- * parser tests
+  tests_Hledger_Read_Common
 )
 where
 --- * imports
@@ -98,11 +101,13 @@ import Prelude.Compat hiding (readFile)
 import Control.Monad.Compat
 import Control.Monad.Except (ExceptT(..), runExceptT, throwError) --, catchError)
 import Control.Monad.State.Strict
+import Data.Bifunctor (first)
 import Data.Char
 import Data.Data
 import Data.Decimal (DecimalRaw (Decimal), Decimal)
 import Data.Default
 import Data.Functor.Identity
+import Data.List (isInfixOf)
 import Data.List.Compat
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Maybe
@@ -117,6 +122,7 @@ import Data.Time.Calendar
 import Data.Time.LocalTime
 import Data.Void (Void)
 import System.Time (getClockTime)
+import Test.HUnit
 import Text.Megaparsec
 import Text.Megaparsec.Char
 import Text.Megaparsec.Char.Lexer (decimal)
@@ -124,6 +130,7 @@ import Text.Megaparsec.Char.Lexer (decimal)
 import Hledger.Data
 import Hledger.Utils
 import qualified Hledger.Query as Q (Query(Any))
+
 
 -- | A hledger journal reader is a triple of storage format name, a
 -- detector of that format, and a parser from that format to Journal.
@@ -758,13 +765,6 @@ disambiguateNumber suggestedStyle (AmbiguousNumber grp1 sep grp2) =
 -- make use of the fact that a decimal point can occur at most once and
 -- must succeed all digit group separators.
 --
--- >>> parseTest rawnumberp "1,234,567.89"
--- Right (WithSeparators ',' ["1","234","567"] (Just ('.',"89")))
--- >>> parseTest rawnumberp "1,000"
--- Left (AmbiguousNumber "1" ',' "000")
--- >>> parseTest rawnumberp "1 000"
--- Right (WithSeparators ' ' ["1","000"] Nothing)
---
 rawnumberp :: TextParser m (Either AmbiguousNumber RawNumber)
 rawnumberp = label "rawnumberp" $ do
   rawNumber <- fmap Right leadingDecimalPt <|> leadingDigits
@@ -853,7 +853,7 @@ digitgroupp = label "digit group"
 
 
 data RawNumber
-  = NoSeparators   DigitGrp (Maybe (Char, DigitGrp))        -- 100 or 100. or .100 or 100.50
+  = NoSeparators   DigitGrp (Maybe (Char, DigitGrp))        -- 100 or 100. or .100
   | WithSeparators Char [DigitGrp] (Maybe (Char, DigitGrp)) -- 1,000,000 or 1,000.50
   deriving (Show, Eq)
 
@@ -1106,21 +1106,6 @@ bracketedpostingdatesp mdefdate = do
 -- default date is provided. A missing year in DATE2 will be inferred
 -- from DATE.
 --
--- >>> either (Left . parseErrorPretty) Right $ rtp (bracketeddatetagsp Nothing) "[2016/1/2=3/4]"
--- Right [("date",2016-01-02),("date2",2016-03-04)]
---
--- >>> either (Left . parseErrorPretty) Right $ rtp (bracketeddatetagsp Nothing) "[1]"
--- Left ...not a bracketed date...
---
--- >>> either (Left . parseErrorPretty) Right $ rtp (bracketeddatetagsp Nothing) "[2016/1/32]"
--- Left ...1:11:...well-formed but invalid date: 2016/1/32...
---
--- >>> either (Left . parseErrorPretty) Right $ rtp (bracketeddatetagsp Nothing) "[1/31]"
--- Left ...1:6:...partial date 1/31 found, but the current year is unknown...
---
--- >>> either (Left . parseErrorPretty) Right $ rtp (bracketeddatetagsp Nothing) "[0123456789/-.=/-.=]"
--- Left ...1:13:...expecting month or day...
---
 bracketeddatetagsp :: Maybe Day -> SimpleTextParser [(TagName, Day)]
 bracketeddatetagsp mdefdate = do
   -- pdbg 0 "bracketeddatetagsp"
@@ -1144,3 +1129,154 @@ bracketeddatetagsp mdefdate = do
   where
     readYear = first3 . toGregorian
     isBracketedDateChar c = isDigit c || isDateSepChar c || c == '='
+
+
+
+
+--- * parser tests
+
+tests_Hledger_Read_Common :: Test
+tests_Hledger_Read_Common = TestLabel "Common parsers" $ TestList
+  [ test_datep'
+  , test_rawnumberp
+  , test_bracketeddatetagsp
+  ]
+
+
+test_datep' :: Test
+test_datep' = TestLabel "datep'" $ TestList
+  [ TestLabel "typical date" $ TestCase $
+      assertResult Nothing "2000/1/1"
+        (fromGregorian 2000 1 1)
+
+  , TestLabel "automatic year inference" $ TestCase $
+      assertResult (Just 2000) "1-1"
+        (fromGregorian 2000 1 1)
+
+  , TestLabel "fail on absence of separators" $ TestCase $
+      assertAnyError Nothing "1"
+
+  , TestLabel "fail on invalid day" $ TestCase $
+      assertErrorFail Nothing "2000/1/32"
+        "invalid date"
+
+  , TestLabel "fail on invalid month" $ TestCase $
+      assertErrorFail Nothing "2000/13/1"
+        "invalid date"
+
+  , TestLabel "fail on partial date without default year" $ TestCase $
+      assertErrorFail Nothing "1/1"
+        "partial date"
+
+  , TestLabel "fail on detecting mixed separators" $ TestCase $
+      assertErrorFail Nothing "2000/1-1"
+        "mixing date separators"
+  ]
+  where
+    assertResult :: Maybe Year -> Text -> Day -> Assertion
+    assertResult mYear = assertParserResult (datep' mYear)
+
+    assertAnyError :: Maybe Year -> Text -> Assertion
+    assertAnyError mYear = assertParserAnyError (datep' mYear)
+
+    assertErrorFail :: Maybe Year -> Text -> String -> Assertion
+    assertErrorFail mYear = assertParserErrorFail (datep' mYear)
+
+
+test_rawnumberp :: Test
+test_rawnumberp = TestLabel "rawnumberp" $ TestList
+  [ TestLabel "digit group separators with decimals" $ TestCase
+      $ assertResult "1,234,567.89"
+      $ Right $ WithSeparators
+          ','
+          [DigitGrp 1 1, DigitGrp 3 234, DigitGrp 3 567]
+          (Just ('.', DigitGrp 2 89))
+
+  , TestLabel "digit group separators without decimals" $ TestCase
+      $ assertResult "1,234,567"
+      $ Right $ WithSeparators
+          ','
+          [DigitGrp 1 1, DigitGrp 3 234, DigitGrp 3 567]
+          Nothing
+
+  , TestLabel "no separators whatsoever" $ TestCase
+      $ assertResult "50"
+      $ Right $ NoSeparators (DigitGrp 2 50) Nothing
+
+  , TestLabel "leading decimal" $ TestCase
+      $ assertResult ".50"
+      $ Right $ NoSeparators mempty (Just ('.', DigitGrp 2 50))
+
+  , TestLabel "trailing decimal" $ TestCase
+      $ assertResult "50."
+      $ Right $ NoSeparators (DigitGrp 2 50) (Just ('.', mempty))
+
+  , TestLabel "ambiguous separator" $ TestCase
+      $ assertResult "1,000"
+      $ Left $ AmbiguousNumber (DigitGrp 1 1) ',' (DigitGrp 3 0)
+
+  , TestLabel "space is not ambiguous (it can only be a digit group separator)"
+      $ TestCase
+      $ assertResult "1 000"
+      $ Right $ WithSeparators ' ' [DigitGrp 1 1, DigitGrp 3 0] Nothing
+  ]
+  where
+    assertResult :: Text -> Either AmbiguousNumber RawNumber -> Assertion
+    assertResult = assertParserResult rawnumberp
+
+
+test_bracketeddatetagsp :: Test
+test_bracketeddatetagsp = TestLabel "bracketeddatetagsp" $ TestList
+  [ TestLabel "inferring the year of the secondary date from the primary date"
+      $ TestCase
+      $ assertResult Nothing "[2000/1/1=1/2]"
+          [ ("date",  fromGregorian 2000 1 1)
+          , ("date2", fromGregorian 2000 1 2)
+          ]
+
+  , TestLabel "only a secondary date"
+      $ TestCase
+      $ assertResult Nothing "[=2000/1/1]"
+          [("date2", fromGregorian 2000 1 1)]
+  ]
+  where
+    assertResult :: Maybe Day -> Text -> [(TagName, Day)] -> Assertion
+    assertResult mDay = assertParserResult (bracketedpostingdatesp mDay)
+
+
+-- * parser testing helpers
+
+assertParserResult
+  :: (Show a, Eq a, Show e, Eq e) => Parsec e Text a -> Text -> a -> Assertion
+assertParserResult parser input expected =
+    assertEqual "Expected parsing to succeed with the following result"
+                (Right expected)
+  $ runParser parser "" input
+
+assertParserAnyError :: (Show a, Eq a) => Parsec e Text a -> Text -> Assertion
+assertParserAnyError parser input =
+    assertEqual "Expected parsing to fail with some error"
+                (Left ())
+  $ first (const ())
+  $ runParser parser "" input
+
+assertParserErrorFail
+  :: (Show a, ShowErrorComponent e) => Parsec e Text a -> Text -> String -> Assertion
+assertParserErrorFail parser input expectedErr =
+  case runParser parser "" input of
+
+    Left (FancyError _ errorSet)
+      | any isExpectedErr errorSet -> pure () -- ok!
+
+    Left parseError -> assertFailure $
+      "The specific error '" <> expectedErr <> "'\n"
+      <> "was not found among the following errors:\n"
+      <> parseErrorPretty parseError
+
+    Right result -> assertFailure $
+      "Expected parser to fail, but parsing succeeded with the following result: "
+      <> show result
+
+  where isExpectedErr fancyErr = case fancyErr of
+          ErrorFail err -> expectedErr `isInfixOf` err
+          _ -> False
