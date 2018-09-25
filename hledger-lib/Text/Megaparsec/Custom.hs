@@ -15,13 +15,34 @@ module Text.Megaparsec.Custom (
   withSource,
 
   -- * Pretty-printing custom parse errors
-  customParseErrorPretty
+  customParseErrorPretty,
+
+
+  -- * Final parse error types
+  FinalParseError,
+  FinalParseError',
+  FinalParseErrorBundle,
+  FinalParseErrorBundle',
+
+  -- * Constructing final parse errors
+  errorFinal,
+  finalFail,
+  finalCustomFailure,
+
+  -- * Handling errors from include files with final parse errors
+  parseIncludeFile,
+  attachSource,
+
+  -- * Pretty-printing final parse errors
+  finalParseErrorPretty,
 )
 where
 
 import Prelude ()
 import "base-compat-batteries" Prelude.Compat hiding (readFile)
 
+import Control.Monad.Except
+import Control.Monad.State.Strict (StateT, evalStateT)
 import Data.Foldable (asum, toList)
 import qualified Data.List.NonEmpty as NE
 import Data.Proxy (Proxy (Proxy))
@@ -127,6 +148,123 @@ customParseErrorPretty source err = case findCustomError err of
 
     finds :: (Foldable t) => (a -> Maybe b) -> t a -> Maybe b
     finds f = asum . map f . toList
+
+
+--- * Final parse error types
+
+-- | A "final" parse error type intended for throwing parse errors without
+-- the possiblity of backtracking when used with 'ExceptT'.
+--
+-- In order to pretty-print a parse error, we must bundle it with the
+-- source text and its filepath (ErrorBundle). However, when an error is
+-- thrown from within a parser, we do not have access to the (full)
+-- source, so we must hold the parse error until it can be joined with the
+-- source text and its filepath by the parser's caller (ErrorFinal).
+
+type FinalParseError = FinalParseError' CustomErr
+
+data FinalParseError' e
+  = ErrorFinal  (ParseError Char e)
+  | ErrorBundle (FinalParseErrorBundle' e)
+  deriving (Show)
+
+-- A 'Monoid' instance is necessary for 'ExceptT (FinalParseError'' e)' to be
+-- an instance of Alternative and MonadPlus, which are required for the use
+-- of e.g. the 'many' parser combinator. We take the left-most error.
+
+instance Semigroup (FinalParseError' e) where
+  e <> _ = e
+
+instance Monoid (FinalParseError' e) where
+  mempty = ErrorFinal $
+    FancyError (initialPos "" NE.:| [])
+               (S.singleton (ErrorFail "default parse error"))
+  mappend = (<>)
+
+-- | A type bundling a 'ParseError' with its source file (for pretty
+-- printing) and a stack of source filepaths (for include files). Although
+-- Megaparsec 6 maintains a stack of source files, making a field of this
+-- type redundant, this capability will be removed in Megaparsec 7.
+-- Therefore, we implement stacks of source files here for a smoother
+-- transition in the future.
+
+type FinalParseErrorBundle = FinalParseErrorBundle' CustomErr
+
+data FinalParseErrorBundle' e = FinalParseErrorBundle'
+  { finalParseError :: ParseError Char e
+  , errorSource     :: Text
+  , sourceFileStack :: NE.NonEmpty FilePath
+  } deriving (Show)
+
+--- * Constructing and throwing final parse errors
+
+errorFinal :: ParseError Char e -> FinalParseError' e
+errorFinal = ErrorFinal
+
+finalFancyFailure
+  :: (MonadParsec e s m, MonadError (FinalParseError' e) m)
+  => S.Set (ErrorFancy e) -> m a
+finalFancyFailure errSet = do
+  pos <- getPosition
+  let parseErr = FancyError (pos NE.:| []) errSet
+  throwError $ ErrorFinal parseErr
+
+finalFail
+  :: (MonadParsec e s m, MonadError (FinalParseError' e) m) => String -> m a
+finalFail = finalFancyFailure . S.singleton . ErrorFail
+
+finalCustomFailure
+  :: (MonadParsec e s m, MonadError (FinalParseError' e) m) => e -> m a
+finalCustomFailure = finalFancyFailure . S.singleton . ErrorCustom
+
+--- * Handling errors from include files with final parse errors
+
+-- | ...
+
+parseIncludeFile
+  :: forall st m a. Monad m
+  => StateT st (ParsecT CustomErr Text (ExceptT FinalParseError m)) a
+  -> st
+  -> FilePath
+  -> Text
+  -> StateT st (ParsecT CustomErr Text (ExceptT FinalParseError m)) a
+parseIncludeFile parser initState filepath text =
+  catchError parser' handler
+  where
+    parser' = do
+      eResult <- lift $ lift $
+                  runParserT (evalStateT parser initState) filepath text
+      case eResult of
+        Left parseError -> throwError $ errorFinal parseError
+        Right result -> pure result
+
+    handler e = throwError $ ErrorBundle $ attachSource filepath text e
+
+-- | ...
+
+attachSource
+  :: FilePath -> Text -> FinalParseError' e -> FinalParseErrorBundle' e
+attachSource filePath sourceText finalParseError =
+  case finalParseError of
+    ErrorFinal parseError -> FinalParseErrorBundle'
+      { finalParseError = parseError
+      , errorSource     = sourceText
+      , sourceFileStack = filePath NE.:| []
+      }
+    ErrorBundle bundle -> bundle
+      { sourceFileStack = filePath NE.<| sourceFileStack bundle
+      }
+
+--- * Pretty-printing final parse errors
+
+-- | ...
+
+finalParseErrorPretty :: FinalParseErrorBundle' CustomErr -> String
+finalParseErrorPretty bundle =
+     concatMap printIncludeFile (NE.init (sourceFileStack bundle))
+  <> customParseErrorPretty (errorSource bundle) (finalParseError bundle)
+  where
+    printIncludeFile path = "in file included from " <> path <> ",\n"
 
 
 --- * Modified Megaparsec source
