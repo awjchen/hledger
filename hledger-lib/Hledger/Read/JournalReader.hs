@@ -208,36 +208,26 @@ includedirectivep = do
 
     parseChild :: MonadIO m => SourcePos -> FilePath -> ErroringJournalParser m ()
     parseChild parentpos filepath = do
-        parentfilestack <- gets (map fst . jfiles)
-        when (filepath `elem` parentfilestack) $ customFailure $
-          parseErrorAt parentpos ("Cyclic include: " ++ filepath)
+      parentj <- get
 
-        childInput <- lift $ readFilePortably filepath
-                             `orRethrowIOError` (show parentpos ++ " reading " ++ filepath)
+      let parentfilestack = map fst $ jfiles parentj
+      when (filepath `elem` parentfilestack) $
+        fail ("Cyclic include: " ++ filepath)
 
-        -- save parent state
-        parentParserState <- getParserState
-        parentj <- get
+      childInput <- lift $ readFilePortably filepath
+                            `orRethrowIOError` (show parentpos ++ " reading " ++ filepath)
+      let initChildj = journalAddFile (filepath, childInput) $
+                        newJournalWithParseStateFrom parentj
 
-        let childj = newJournalWithParseStateFrom parentj
+      let parser = choiceInState
+            [ journalp
+            , timeclockfilep
+            , timedotfilep
+            ] -- can't include a csv file yet, that reader is special
+      updatedChildj <- parseIncludeFile parser initChildj filepath childInput
 
-        -- set child state
-        setInput childInput
-        pushPosition $ initialPos filepath
-        put childj
-
-        -- parse include file
-        let parsers = [ journalp
-                      , timeclockfilep
-                      , timedotfilep
-                      ] -- can't include a csv file yet, that reader is special
-        updatedChildj <- journalAddFile (filepath, childInput) <$>
-                        region (withSource childInput) (choiceInState parsers)
-
-        -- restore parent state, prepending the child's parse info
-        setParserState parentParserState
-        put $ updatedChildj <> parentj
-        -- discard child's parse info, prepend its (reversed) list data, combine other fields
+      -- discard child's parse info, prepend its (reversed) list data, combine other fields
+      put $ updatedChildj <> parentj {jfiles = []}
 
 
 newJournalWithParseStateFrom :: Journal -> Journal
@@ -249,6 +239,7 @@ newJournalWithParseStateFrom j = mempty{
   ,jcommodities           = jcommodities j
   -- ,jparsetransactioncount = jparsetransactioncount j
   ,jparsetimeclockentries = jparsetimeclockentries j
+  ,jfiles                 = jfiles j
   }
 
 -- | Lift an IO action into the exception monad, rethrowing any IO

@@ -337,9 +337,7 @@ clearAccountAliases = modify' (\(j@Journal{..}) -> j{jparsealiases=[]})
 --   getTransactionCount
 
 journalAddFile :: (FilePath,Text) -> Journal -> Journal
-journalAddFile f j@Journal{jfiles=fs} = j{jfiles=fs++[f]}
-  -- append, unlike the other fields, even though we do a final reverse,
-  -- to compensate for additional reversal due to including/monoid-concatting
+journalAddFile f j@Journal{jfiles=fs} = j{jfiles=f:fs}
 
 --- * parsers
 

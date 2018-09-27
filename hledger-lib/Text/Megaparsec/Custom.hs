@@ -219,7 +219,7 @@ finalCustomFailure = finalFancyFailure . S.singleton . ErrorCustom
 
 --- * Handling errors from include files with final parse errors
 
--- | ...
+-- | ... ensuring that errors are assigned to the included file
 
 parseIncludeFile
   :: forall st m a. Monad m
