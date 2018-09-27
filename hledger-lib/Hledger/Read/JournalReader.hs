@@ -189,6 +189,7 @@ includedirectivep = do
   void newline
 
   where
+    getFilePaths :: MonadIO m => SourcePos -> FilePath -> JournalParser m [FilePath]
     getFilePaths parserpos filename = do
         curdir <- lift $ expandPath (takeDirectory $ sourceName parserpos) ""
                          `orRethrowIOError` (show parserpos ++ " locating " ++ filename)
@@ -205,8 +206,9 @@ includedirectivep = do
             else customFailure $ parseErrorAt parserpos $
                    "No existing files match pattern: " ++ filename
 
+    parseChild :: MonadIO m => SourcePos -> FilePath -> ErroringJournalParser m ()
     parseChild parentpos filepath = do
-        parentfilestack <- fmap sourceName . statePos <$> getParserState
+        parentfilestack <- gets (map fst . jfiles)
         when (filepath `elem` parentfilestack) $ customFailure $
           parseErrorAt parentpos ("Cyclic include: " ++ filepath)
 
